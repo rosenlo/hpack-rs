@@ -318,11 +318,17 @@ impl<'a> Decoder<'a> {
     ///
     /// If an error is encountered during the decoding of any header, decoding halts and the
     /// appropriate error is returned as the `Err` variant of the `Result`.
-    pub fn decode_with_cb<F>(&mut self, buf: &[u8], mut cb: F) -> Result<(), DecoderError>
+    ///
+    /// On success, returns the number of headers that were skipped due to dynamic table
+    /// desynchronization (i.e., indexed references that resolved to empty entries because the
+    /// decoder joined a connection mid-stream and never saw the original header insertion).
+    /// A non-zero value indicates the HPACK dynamic table is out of sync with the encoder.
+    pub fn decode_with_cb<F>(&mut self, buf: &[u8], mut cb: F) -> Result<usize, DecoderError>
     where
         F: FnMut(Cow<[u8]>, Cow<[u8]>),
     {
         let mut current_octet_index = 0;
+        let mut dynamic_table_miss = 0usize;
 
         while current_octet_index < buf.len() {
             // At this point we are always at the beginning of the next block
@@ -336,6 +342,8 @@ impl<'a> Decoder<'a> {
                     let ((name, value), consumed) = self.decode_indexed(buffer_leftover)?;
                     if !name.is_empty() {
                         cb(Cow::Borrowed(name), Cow::Borrowed(value));
+                    } else {
+                        dynamic_table_miss += 1;
                     }
 
                     consumed
@@ -346,6 +354,8 @@ impl<'a> Decoder<'a> {
                             self.decode_literal(buffer_leftover, true)?;
                         if !name.is_empty() {
                             cb(Cow::Borrowed(&name), Cow::Borrowed(&value));
+                        } else {
+                            dynamic_table_miss += 1;
                         }
                         // Since we are to add the decoded header to the header table, we need to
                         // convert them into owned buffers that the decoder can keep internally.
@@ -367,6 +377,8 @@ impl<'a> Decoder<'a> {
                     let ((name, value), consumed) = self.decode_literal(buffer_leftover, false)?;
                     if !name.is_empty() {
                         cb(name, value);
+                    } else {
+                        dynamic_table_miss += 1;
                     }
 
                     consumed
@@ -379,6 +391,8 @@ impl<'a> Decoder<'a> {
                     let ((name, value), consumed) = self.decode_literal(buffer_leftover, false)?;
                     if !name.is_empty() {
                         cb(name, value);
+                    } else {
+                        dynamic_table_miss += 1;
                     }
 
                     consumed
@@ -395,7 +409,7 @@ impl<'a> Decoder<'a> {
             current_octet_index += consumed;
         }
 
-        Ok(())
+        Ok(dynamic_table_miss)
     }
 
     /// Decode the header block found in the given buffer.
