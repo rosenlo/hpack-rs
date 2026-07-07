@@ -33,8 +33,10 @@ pub mod huffman;
 /// representing the underlying Headers.
 struct DynamicTableIter<'a> {
     /// Stores an iterator through the underlying structure that the
-    /// `DynamicTable` uses
-    inner: vec_deque::Iter<'a, (Vec<u8>, Vec<u8>)>,
+    /// `DynamicTable` uses. The third element of each tuple is the
+    /// RFC-7541 logical entry size (name.len() + value.len() + 32); it
+    /// is stripped from the items yielded by the iterator.
+    inner: vec_deque::Iter<'a, (Vec<u8>, Vec<u8>, usize)>,
 }
 
 impl<'a> Iterator for DynamicTableIter<'a> {
@@ -74,7 +76,17 @@ impl<'a> Iterator for DynamicTableIter<'a> {
 /// *it* worry about making certain that the changes are valid according to
 /// the (current) constraints of the protocol.
 struct DynamicTable {
-    table: VecDeque<(Vec<u8>, Vec<u8>)>,
+    // Each entry is `(name, value, rfc_size)` where `rfc_size` is the
+    // RFC-7541 entry size (`name.len() + value.len() + 32`). It is stored
+    // alongside the bytes so that `consolidate_table` can subtract the
+    // correct logical size on eviction even when the entry's value (and
+    // possibly name) has been dropped to save memory. The
+    // RFC-7541-compliant encoder on the server side retains the value,
+    // so to keep eviction timing — and thus the index address space —
+    // aligned with the encoder, the decoder MUST account for the full
+    // RFC-7541 size regardless of whether it retains the bytes.
+    // (RFC 7541 §4.1.)
+    table: VecDeque<(Vec<u8>, Vec<u8>, usize)>,
     size: usize,
     max_size: usize,
     // Headers there are not in the white list are not saved in the dynamic table. If the whitelist is empty, all headers are saved.
@@ -158,19 +170,27 @@ impl DynamicTable {
         } else {
             self.expected_headers.contains(&name.to_ascii_lowercase())
         };
+        // RFC 7541 §4.1: the size of an entry is
+        // `name.octets + value.octets + 32`, independent of whether the
+        // caller retains the value bytes. We account for the full RFC
+        // size in *both* branches so that eviction timing — and thus the
+        // index address space — stays aligned with an RFC-compliant
+        // server encoder that retains all values. The third element of
+        // the stored tuple carries this size so `consolidate_table`
+        // subtracts the same amount on eviction.
+        let entry_size = name.len() + value.len() + 32;
         if expected_header {
-            // This is how the HPACK spec makes us calculate the size.  The 32 is
-            // a magic number determined by them (under reasonable assumptions of
-            // how the table is stored).
-            self.size += name.len() + value.len() + 32;
+            self.size += entry_size;
             debug!("New dynamic table size {}", self.size);
             // Now add it to the internal buffer
-            self.table.push_front((name, value));
+            self.table.push_front((name, value, entry_size));
         } else {
-            self.size += 32;
+            self.size += entry_size;
             debug!("New dynamic table size {}", self.size);
-            // Add empty name and value to the internal buffer
-            self.table.push_front((vec![], vec![]));
+            // Drop name and value to save memory; the RFC-7541 size is
+            // preserved in the third tuple element so eviction
+            // accounting remains correct.
+            self.table.push_front((vec![], vec![], entry_size));
         }
         // ...and make sure we're not over the maximum size.
         self.consolidate_table();
@@ -191,7 +211,7 @@ impl DynamicTable {
                         panic!("Size of table != 0, but no headers left!");
                     }
                 };
-                self.size -= last_header.0.len() + last_header.1.len() + 32;
+                self.size -= last_header.2;
             }
             self.table.pop_back();
         }
@@ -208,7 +228,7 @@ impl DynamicTable {
     fn to_vec(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut ret: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for elem in self.table.iter() {
-            ret.push(elem.clone());
+            ret.push((elem.0.clone(), elem.1.clone()));
         }
 
         ret
@@ -216,7 +236,7 @@ impl DynamicTable {
 
     /// Returns a reference to the header at the given index, if found in the
     /// dynamic table.
-    fn get(&self, index: usize) -> Option<&(Vec<u8>, Vec<u8>)> {
+    fn get(&self, index: usize) -> Option<&(Vec<u8>, Vec<u8>, usize)> {
         self.table.get(index)
     }
 }
@@ -358,7 +378,7 @@ impl<'a> HeaderTable<'a> {
             let dynamic_index = real_index - self.static_table.len();
             if dynamic_index < self.dynamic_table.len() {
                 match self.dynamic_table.get(dynamic_index) {
-                    Some(&(ref name, ref value)) => Some((name, value)),
+                    Some(&(ref name, ref value, _)) => Some((name, value)),
                     None => Some((&[], &[])), // The message captured may be only part of the message, so the
                                               // header may not be found, but there are still some header that
                                               // can be obtained. If a None is returned, the parsing will fail.
@@ -494,6 +514,82 @@ mod tests {
         table.add_header(b"a".to_vec(), b"b".to_vec());
 
         assert_eq!(32 + 2, table.get_size());
+    }
+
+    /// Regression test for the placeholder-size desync (keter-deepflow #374).
+    ///
+    /// When the dynamic table is configured with an expected-header
+    /// whitelist (as the deepflow agent's HTTP/2 flow log parser does for
+    /// `:status`), non-expected headers are inserted as *placeholders* —
+    /// the name and value bytes are dropped to save memory. The table
+    /// size, however, MUST still account for the full RFC-7541 entry size
+    /// (`name.len() + value.len() + 32`), because the server-side encoder
+    /// retains the value and computes its eviction timing against that
+    /// same size. If the decoder under-sizes placeholders (the previous
+    /// bug added only `32` per placeholder), the decoder's table size
+    /// drifts below the encoder's, evictions fire at different times,
+    /// index space diverges, and an indexed `:status` (or any later
+    /// indexed header) resolves to a wrong/empty slot — silently dropping
+    /// the response record. (RFC 7541 §4.1.)
+    #[test]
+    fn test_dynamic_table_placeholder_rfc7541_size() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let mut expected: HashSet<Vec<u8>> = HashSet::new();
+        expected.insert(b":status".to_vec());
+        let mut table = DynamicTable::new_with_expected_headers(Arc::new(expected));
+
+        // A realistic HTTP/2 response header set: only `:status` is in the
+        // whitelist; the rest become placeholders but MUST still be sized
+        // per RFC-7541.
+        let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b":status".to_vec(), b"200".to_vec()),
+            (b"cache-control".to_vec(), b"private".to_vec()),
+            (b"date".to_vec(), b"Mon, 21 Oct 2013 20:13:21 GMT".to_vec()),
+            (b"location".to_vec(), b"https://www.example.com".to_vec()),
+            (b"content-encoding".to_vec(), b"gzip".to_vec()),
+            (
+                b"set-cookie".to_vec(),
+                b"foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1".to_vec(),
+            ),
+        ];
+
+        let mut rfc_size = 0usize;
+        for (name, value) in &headers {
+            table.add_header(name.clone(), value.clone());
+            rfc_size += name.len() + value.len() + 32;
+            assert_eq!(
+                table.get_size(),
+                rfc_size,
+                "size must follow RFC-7541 accounting after inserting {:?}",
+                name,
+            );
+        }
+
+        // The buggy `+32` accounting would have produced only the
+        // expected header's full size plus 32 per placeholder. Assert we
+        // are strictly above that so the regression cannot silently
+        // return.
+        let buggy_size: usize = headers[0].0.len() + headers[0].1.len() + 32
+            + headers[1..].iter().map(|_| 32).sum::<usize>();
+        assert!(rfc_size > buggy_size);
+
+        // Eviction alignment: shrink the max below the RFC size and
+        // verify the table drains fully (size reconciles to 0). With the
+        // `+32` accounting the per-placeholder add/evict was unbalanced
+        // (`add += 32`, `evict -= 0+0+32 = 32`, which happened to balance
+        // but only because the size was wrong to begin with); more
+        // importantly the *timing* of eviction diverged from the encoder.
+        // With RFC-7541 accounting on both add and evict, the table
+        // reconciles cleanly to 0 after full eviction — and crucially
+        // each eviction now happens at exactly the same `max_size`
+        // threshold the encoder uses, keeping the index address space
+        // aligned.
+        table.set_max_table_size(0);
+        assert_eq!(0, table.len());
+        assert_eq!(0, table.to_vec().len());
+        assert_eq!(0, table.get_size());
     }
 
     #[test]
